@@ -1,0 +1,6 @@
+1. usertrap()
+2. The value is 0x7. It represents the system call number for exec (SYS_exec).
+3. User mode.
+4. lw a5, 0(zero). The register is a5.
+5. The kernel crashes because it attempts to dereference a null pointer (read from address 0x0). This address is not mapped in the kernel's virtual address space, which causes a "Load page fault" exception, leading to a kernel panic.
+6. The process name is "initcode" and its pid is 1.
