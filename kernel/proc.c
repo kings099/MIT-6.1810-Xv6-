@@ -139,6 +139,26 @@ found:
     release(&p->lock);
     return 0;
   }
+  
+   if((p->usyscall_page = (uint64)kalloc()) == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 2. Map it into the user page table as read-only.
+  if(mappages(p->pagetable, USYSCALL, PGSIZE, p->usyscall_page, PTE_R | PTE_U) < 0) {
+    // Note: No need to kfree here. freeproc will handle it because we
+    // have already modified freeproc to clean up p->usyscall_page.
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 3. Initialize the page with the process's PID.
+  // We can do this here because p->pid is already assigned.
+  struct usyscall *u = (struct usyscall*)p->usyscall_page;
+  u->pid = p->pid;
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -158,6 +178,9 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  if(p->usyscall_page)
+    kfree((void*)p->usyscall_page);
+  p->usyscall_page = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -212,6 +235,9 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+
+  uvmunmap(pagetable, USYSCALL, 1, 0);
+
   uvmfree(pagetable, sz);
 }
 

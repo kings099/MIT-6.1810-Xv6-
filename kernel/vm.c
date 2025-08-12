@@ -487,10 +487,48 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 }
 
 
+// Recursive helper for vmprint.
+// It descends the page table tree, printing valid PTEs.
+// base_va accumulates the virtual address bits from parent levels.
+void vmprint_recursive_full_va(pagetable_t pagetable, int depth, uint64 base_va) {
+  // A page table holds 512 PTEs.
+  for(uint64 i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+
+    // We only care about valid PTEs.
+    if(pte & PTE_V){
+      // Calculate the full virtual address for this entry.
+      // The shift amount depends on the level (depth).
+      // Sv39 levels are 9 bits each, on top of a 12-bit page offset.
+      // Depth 0 (L2) shifts by 30, Depth 1 (L1) by 21, Depth 2 (L0) by 12.
+      uint64 current_va = base_va + (i << (30 - 9 * depth));
+      uint64 pa = PTE2PA(pte);
+
+      // Print indentation to show tree structure.
+      for (int d = 0; d <= depth; d++) {
+        printf(" ..");
+      }
+      
+      // Print the VA, PTE, and PA.
+      // IMPORTANT: Cast all uint64 variables to (void *) for %p.
+      printf("%p: pte %p pa %p\n", (void *)current_va, (void *)pte, (void *)pa);
+
+      // If R, W, and X bits are all 0, it's a branch to a lower-level table.
+      if((pte & (PTE_R | PTE_W | PTE_X)) == 0){
+        // Recurse into the next level, but not beyond the last level (depth 2).
+        if (depth < 2) {
+          vmprint_recursive_full_va((pagetable_t)pa, depth + 1, current_va);
+        }
+      }
+    }
+  }
+}
+
 #ifdef LAB_PGTBL
 void
 vmprint(pagetable_t pagetable) {
-  // your code here
+    printf("page table 0x%p\n", (void *)pagetable);
+  vmprint_recursive_full_va(pagetable, 0, 0);
 }
 #endif
 
