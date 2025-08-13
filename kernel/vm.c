@@ -202,14 +202,43 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 
   for(a = va; a < va + npages*PGSIZE; a += sz){
     sz = PGSIZE;
-    if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
+    
+#ifdef LAB_PGTBL
+    // Check for superpages - we need to handle L1 PTEs that are leaves
+    // First check if this is aligned to a superpage boundary
+    if((a % SUPERPGSIZE) == 0 && npages >= 512) {
+      // Check L2 PTE
+      pte_t *l2_pte = &pagetable[PX(2, a)];
+      if((*l2_pte & PTE_V) != 0) {
+        pagetable_t l1_table = (pagetable_t)PTE2PA(*l2_pte);
+        pte_t *l1_pte = &l1_table[PX(1, a)];
+        
+        // Check if L1 PTE is a superpage leaf
+        if((*l1_pte & PTE_V) && PTE_LEAF(*l1_pte)) {
+          // This is a superpage
+          if(do_free) {
+            uint64 pa = PTE2PA(*l1_pte);
+            superfree((void*)pa);
+          }
+          *l1_pte = 0;
+          sz = SUPERPGSIZE;
+          continue;
+        }
+      }
+    }
+#endif
+    
+    if((pte = walk(pagetable, a, 0)) == 0) {
+      // Skip pages that don't have page table entries
+      continue;
+    }
     if((*pte & PTE_V) == 0) {
-      printf("va=%ld pte=%ld\n", a, *pte);
-      panic("uvmunmap: not mapped");
+      // Skip pages that are not mapped - this is not an error
+      continue;
     }
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
+    
     if(do_free){
       uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
@@ -263,6 +292,54 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   oldsz = PGROUNDUP(oldsz);
   for(a = oldsz; a < newsz; a += sz){
     sz = PGSIZE;
+    
+#ifdef LAB_PGTBL
+    // Check if we can use a superpage:
+    // 1. Virtual address is 2MB-aligned
+    // 2. Remaining space is at least 2MB
+    // 3. A superpage is available
+    if((a % SUPERPGSIZE) == 0 && (newsz - a) >= SUPERPGSIZE) {
+      mem = superalloc();
+      if(mem != 0) {
+        sz = SUPERPGSIZE;
+        memset(mem, 0, sz);
+        
+        // Create superpage mapping by setting PTE in L1 page table
+        // We need to manually walk to L1 level to create a superpage
+        pte_t *pte;
+        
+        // Walk to L2 level
+        pte = &pagetable[PX(2, a)];
+        if((*pte & PTE_V) == 0) {
+          pagetable_t l1_table = (pagetable_t)kalloc();
+          if(l1_table == 0) {
+            superfree(mem);
+            uvmdealloc(pagetable, a, oldsz);
+            return 0;
+          }
+          memset(l1_table, 0, PGSIZE);
+          *pte = PA2PTE(l1_table) | PTE_V;
+        }
+        
+        // Now get L1 PTE and set it as a superpage leaf
+        pagetable_t l1_table = (pagetable_t)PTE2PA(*pte);
+        pte = &l1_table[PX(1, a)];
+        if(*pte & PTE_V) {
+          // L1 PTE already exists, can't use superpage
+          superfree(mem);
+          sz = PGSIZE;
+          goto regular_alloc;
+        }
+        
+        // Set the L1 PTE as a leaf (superpage)
+        *pte = PA2PTE(mem) | PTE_V | PTE_R | PTE_U | xperm;
+        continue;
+      }
+    }
+#endif
+    
+regular_alloc:
+    // Fall back to regular page allocation
     mem = kalloc();
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
@@ -345,7 +422,50 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += szinc){
     szinc = PGSIZE;
-    szinc = PGSIZE;
+    
+#ifdef LAB_PGTBL
+    // Check for superpages
+    if((i % SUPERPGSIZE) == 0 && (sz - i) >= SUPERPGSIZE) {
+      // Check if this is a superpage in the old page table
+      pte_t *l2_pte = &old[PX(2, i)];
+      if((*l2_pte & PTE_V) != 0) {
+        pagetable_t l1_table = (pagetable_t)PTE2PA(*l2_pte);
+        pte_t *l1_pte = &l1_table[PX(1, i)];
+        
+        if((*l1_pte & PTE_V) && PTE_LEAF(*l1_pte)) {
+          // This is a superpage, copy it
+          pa = PTE2PA(*l1_pte);
+          flags = PTE_FLAGS(*l1_pte);
+          
+          if((mem = superalloc()) == 0)
+            goto err;
+          memmove(mem, (char*)pa, SUPERPGSIZE);
+          
+          // Create superpage in new page table
+          // Ensure L2 PTE exists
+          pte_t *new_l2_pte = &new[PX(2, i)];
+          if((*new_l2_pte & PTE_V) == 0) {
+            pagetable_t new_l1_table = (pagetable_t)kalloc();
+            if(new_l1_table == 0) {
+              superfree(mem);
+              goto err;
+            }
+            memset(new_l1_table, 0, PGSIZE);
+            *new_l2_pte = PA2PTE(new_l1_table) | PTE_V;
+          }
+          
+          // Set L1 PTE as superpage
+          pagetable_t new_l1_table = (pagetable_t)PTE2PA(*new_l2_pte);
+          pte_t *new_l1_pte = &new_l1_table[PX(1, i)];
+          *new_l1_pte = PA2PTE(mem) | flags;
+          
+          szinc = SUPERPGSIZE;
+          continue;
+        }
+      }
+    }
+#endif
+    
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
@@ -489,36 +609,35 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 
 // Recursive helper for vmprint.
 // It descends the page table tree, printing valid PTEs.
-// base_va accumulates the virtual address bits from parent levels.
-void vmprint_recursive_full_va(pagetable_t pagetable, int depth, uint64 base_va) {
-  // A page table holds 512 PTEs.
-  for(uint64 i = 0; i < 512; i++){
+void vmprint_recursive(pagetable_t pagetable, int level, uint64 va_base) {
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
     pte_t pte = pagetable[i];
-
-    // We only care about valid PTEs.
     if(pte & PTE_V){
-      // Calculate the full virtual address for this entry.
-      // The shift amount depends on the level (depth).
-      // Sv39 levels are 9 bits each, on top of a 12-bit page offset.
-      // Depth 0 (L2) shifts by 30, Depth 1 (L1) by 21, Depth 2 (L0) by 12.
-      uint64 current_va = base_va + (i << (30 - 9 * depth));
+      // Calculate the virtual address for this entry
+      // For RISC-V Sv39: level 0 = L2, level 1 = L1, level 2 = L0
+      uint64 va = va_base | ((uint64)i << (PXSHIFT(2-level)));
+      
+      // Handle sign extension for high addresses in Sv39
+      // The top bit (bit 38) determines the sign
+      if(va & (1UL << 38)) {
+        // Sign extend for high virtual addresses
+        va |= 0xFFFF000000000000UL;
+      }
+      
       uint64 pa = PTE2PA(pte);
-
-      // Print indentation to show tree structure.
-      for (int d = 0; d <= depth; d++) {
+      
+      // Print indentation based on level
+      for(int j = 0; j <= level; j++){
         printf(" ..");
       }
       
-      // Print the VA, PTE, and PA.
-      // IMPORTANT: Cast all uint64 variables to (void *) for %p.
-      printf("%p: pte %p pa %p\n", (void *)current_va, (void *)pte, (void *)pa);
-
-      // If R, W, and X bits are all 0, it's a branch to a lower-level table.
-      if((pte & (PTE_R | PTE_W | PTE_X)) == 0){
-        // Recurse into the next level, but not beyond the last level (depth 2).
-        if (depth < 2) {
-          vmprint_recursive_full_va((pagetable_t)pa, depth + 1, current_va);
-        }
+      printf("%p: pte %p pa %p\n", (void*)va, (void*)pte, (void*)pa);
+      
+      // If this PTE points to a lower-level page table, recurse
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        // this PTE points to a lower-level page table.
+        vmprint_recursive((pagetable_t)pa, level + 1, va);
       }
     }
   }
@@ -527,8 +646,8 @@ void vmprint_recursive_full_va(pagetable_t pagetable, int depth, uint64 base_va)
 #ifdef LAB_PGTBL
 void
 vmprint(pagetable_t pagetable) {
-    printf("page table 0x%p\n", (void *)pagetable);
-  vmprint_recursive_full_va(pagetable, 0, 0);
+  printf("page table %p\n", pagetable);
+  vmprint_recursive(pagetable, 0, 0);
 }
 #endif
 
