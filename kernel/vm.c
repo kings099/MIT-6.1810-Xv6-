@@ -305,8 +305,8 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 
 // Given a parent process's page table, copy
 // its memory into a child's page table.
-// Copies both the page table and the
-// physical memory.
+// For COW fork, just map parent's physical pages 
+// into child and mark both as COW pages.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
@@ -315,7 +315,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -324,13 +323,21 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    
+    // If the page was writable, mark it as COW and remove write permission
+    if(flags & PTE_W) {
+      // Remove write permission and mark as COW
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
+    }
+    
+    // Map the same physical page into child's page table
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+    
+    // Increment reference count for the shared page
+    kref((void*)pa);
   }
   return 0;
 
@@ -365,9 +372,27 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
+    
     pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+    if(pte == 0)
+      return -1;
+    if((*pte & PTE_V) == 0)
+      return -1;
+    if((*pte & PTE_U) == 0)
+      return -1;
+    
+    // Check if this is a COW page that needs to be handled
+    if((*pte & PTE_COW)) {
+      // This is a COW page, handle the fault
+      if(cowfault(pagetable, va0) != 0)
+        return -1;
+      // Re-walk to get updated PTE
+      pte = walk(pagetable, va0, 0);
+      if(pte == 0)
+        return -1;
+    }
+    
+    if((*pte & PTE_W) == 0)
       return -1;
     pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);
@@ -448,4 +473,42 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+// Handle copy-on-write page fault
+// Allocate a new page, copy content, and update PTE
+int
+cowfault(pagetable_t pagetable, uint64 va)
+{
+  if(va >= MAXVA)
+    return -1;
+    
+  va = PGROUNDDOWN(va);
+  
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return -1;
+    
+  if((*pte & PTE_V) == 0 || (*pte & PTE_COW) == 0 || (*pte & PTE_U) == 0)
+    return -1;
+    
+  uint64 pa = PTE2PA(*pte);
+  uint flags = PTE_FLAGS(*pte);
+  
+  // Allocate new page
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1;
+    
+  // Copy content from old page to new page
+  memmove(mem, (char*)pa, PGSIZE);
+  
+  // Update PTE to point to new page with write permission
+  flags = (flags & ~PTE_COW) | PTE_W;
+  *pte = PA2PTE((uint64)mem) | flags;
+  
+  // Decrease reference count for old page
+  kfree((void*)pa);
+  
+  return 0;
 }
