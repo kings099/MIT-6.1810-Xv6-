@@ -301,6 +301,51 @@ create(char *path, short type, short major, short minor)
   return 0;
 }
 
+// Follow a symbolic link, with cycle detection
+static struct inode*
+follow_symlink(struct inode *ip, int depth)
+{
+  char target[MAXPATH];
+  struct inode *next_ip;
+  int len;
+
+  // Avoid cycles: give up after a small constant depth.
+  // ip is locked on entry; if we fail, we must drop it.
+  if(depth > 10){
+    iunlockput(ip);
+    return 0;
+  }
+
+  if(ip->type != T_SYMLINK)
+    return ip; // return still-locked non-symlink inode
+
+  // Read the target path from the symlink (do not exceed MAXPATH-1)
+  if((len = readi(ip, 0, (uint64)target, 0, MAXPATH-1)) <= 0){
+    iunlockput(ip);
+    return 0;
+  }
+  // Null-terminate the target string
+  target[len] = 0;
+
+  // We no longer need ip locked while doing a pathname lookup.
+  iunlock(ip);
+
+  // Look up the target
+  if((next_ip = namei(target)) == 0){
+    // Target not found; drop our reference to the symlink inode and fail.
+    iput(ip);
+    return 0;
+  }
+
+  // Lock the looked-up inode before recursing, and drop the symlink inode.
+  ilock(next_ip);
+  iput(ip);
+
+  // Recursively follow if the target is also a symlink. The callee will
+  // either return a locked non-symlink inode or release next_ip on failure.
+  return follow_symlink(next_ip, depth + 1);
+}
+
 uint64
 sys_open(void)
 {
@@ -328,6 +373,17 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+    
+    // Handle symbolic links
+    if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)){
+      ip = follow_symlink(ip, 0);
+      if(ip == 0){
+        end_op();
+        return -1;
+      }
+      // ip is already locked by follow_symlink
+    }
+    
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -501,5 +557,34 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+  
+  // Create a new symbolic link inode
+  if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
+    end_op();
+    return -1;
+  }
+
+  // Write the target path into the symlink's data blocks
+  if(writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target)){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
   return 0;
 }
