@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -503,3 +504,268 @@ sys_pipe(void)
   }
   return 0;
 }
+
+#ifdef LAB_MMAP
+uint64
+sys_mmap(void)
+{
+  uint64 addr;
+  uint64 len;
+  int prot, flags, fd;
+  uint64 offset;
+  struct file *f;
+  struct proc *p = myproc();
+  struct vma *vma;
+  
+  // Get arguments
+  argaddr(0, &addr);
+  argaddr(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  argint(4, &fd);
+  argaddr(5, &offset);
+  
+  // Basic argument validation
+  if(addr != 0) // we only support addr == 0
+    return 0xffffffffffffffff;
+  
+  if(len == 0)
+    return 0xffffffffffffffff;
+    
+  if(fd < 0 || fd >= NOFILE || (f = p->ofile[fd]) == 0)
+    return 0xffffffffffffffff;
+  
+  // Check permissions
+  if(flags == MAP_SHARED) {
+    if((prot & PROT_WRITE) && !f->writable)
+      return 0xffffffffffffffff;
+  }
+  if(!f->readable)
+    return 0xffffffffffffffff;
+    
+  // Find an unused VMA slot
+  vma = 0;
+  for(int i = 0; i < NVMA; i++) {
+    if(!p->vmas[i].used) {
+      vma = &p->vmas[i];
+      break;
+    }
+  }
+  if(vma == 0)
+    return 0xffffffffffffffff;
+  
+  // Find a free virtual address region
+  uint64 va = MAXVA - PGSIZE; // start from near the top
+  uint64 sz = PGROUNDUP(len);
+  
+  // Simple allocation: just check if the region starting at va is free
+  for(; va >= p->sz + sz; va -= PGSIZE) {
+    int conflict = 0;
+    // Check against existing VMAs
+    for(int i = 0; i < NVMA; i++) {
+      if(p->vmas[i].used) {
+        uint64 vma_start = p->vmas[i].addr;
+        uint64 vma_end = vma_start + p->vmas[i].len;
+        if(!(va + sz <= vma_start || va >= vma_end)) {
+          conflict = 1;
+          break;
+        }
+      }
+    }
+    // Also check against TRAPFRAME and TRAMPOLINE
+    if(va + sz > TRAPFRAME) {
+      conflict = 1;
+    }
+    if(!conflict)
+      break;
+  }
+  if(va < p->sz + sz)
+    return 0xffffffffffffffff;
+  
+  // Set up the VMA
+  vma->used = 1;
+  vma->addr = va;
+  vma->len = PGROUNDUP(len);
+  vma->prot = prot;
+  vma->flags = flags;
+  vma->f = filedup(f);
+  vma->offset = offset;
+  
+  return va;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  uint64 len;
+  struct proc *p = myproc();
+  
+  argaddr(0, &addr);
+  argaddr(1, &len);
+  
+  // Find the VMA
+  struct vma *vma = 0;
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used && 
+       addr >= p->vmas[i].addr && 
+       addr < p->vmas[i].addr + p->vmas[i].len) {
+      vma = &p->vmas[i];
+      break;
+    }
+  }
+  
+  if(vma == 0)
+    return -1;
+  
+  // For simplicity, we only support unmapping the entire region
+  // or unmapping from the start or end
+  if(addr != vma->addr && addr + len != vma->addr + vma->len)
+    return -1;
+  
+  // Unmap pages and write back if MAP_SHARED
+  uint64 start = PGROUNDDOWN(addr);
+  uint64 end = PGROUNDUP(addr + len);
+  
+  // First collect dirty pages for MAP_SHARED
+  struct {
+    struct inode *ip;
+    uint64 pa;
+    uint64 offset;
+    uint64 vma_offset;
+    uint64 vma_len;
+    int valid;
+  } dirty_pages[16];
+  int ndirty = 0;
+  
+  for(uint64 va = start; va < end; va += PGSIZE) {
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if(pte && (*pte & PTE_V)) {
+      // If MAP_SHARED, collect for write back (don't rely on D bit)
+      if(vma->flags == MAP_SHARED) {
+        if(ndirty < 16) {
+          dirty_pages[ndirty].ip = vma->f->ip;
+          dirty_pages[ndirty].pa = PTE2PA(*pte);
+          dirty_pages[ndirty].offset = vma->offset + (va - vma->addr);
+          dirty_pages[ndirty].vma_offset = vma->offset;
+          dirty_pages[ndirty].vma_len = vma->len;
+          dirty_pages[ndirty].valid = 1;
+          ndirty++;
+        }
+      }
+    }
+  }
+  
+  // Write back dirty pages within transaction
+  if(ndirty > 0) {
+    begin_op();
+    for(int i = 0; i < ndirty; i++) {
+      if(dirty_pages[i].valid) {
+        ilock(dirty_pages[i].ip);
+        // Calculate how many bytes to write (don't extend file beyond ip->size)
+        uint64 bytes_to_write = 0;
+        uint64 file_end = dirty_pages[i].ip->size;
+        if(dirty_pages[i].offset < file_end) {
+          uint64 max_bytes = file_end - dirty_pages[i].offset;
+          bytes_to_write = max_bytes > PGSIZE ? PGSIZE : max_bytes;
+        }
+        if(bytes_to_write > 0) {
+          // In xv6 the kernel directly maps PA==VA for RAM; use PA as KVA
+          uint64 kva = dirty_pages[i].pa;
+          writei(dirty_pages[i].ip, 0, kva, dirty_pages[i].offset, bytes_to_write);
+        }
+        iunlock(dirty_pages[i].ip);
+      }
+    }
+    end_op();
+  }
+  
+  // Unmap the pages (only unmap pages that are actually mapped)
+  for(uint64 va = start; va < end; va += PGSIZE) {
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if(pte && (*pte & PTE_V)) {
+      uvmunmap(p->pagetable, va, 1, 1);
+    }
+  }
+  
+  // Update or remove the VMA
+  if(addr == vma->addr && len == vma->len) {
+    // Remove entire mapping
+    fileclose(vma->f);
+    vma->used = 0;
+  } else if(addr == vma->addr) {
+    // Unmapping from start
+    vma->addr += len;
+    vma->len -= len;
+    vma->offset += len;
+  } else {
+    // Unmapping from end
+    vma->len -= len;
+  }
+  
+  return 0;
+}
+
+// Handle page fault for mmap regions
+int
+handle_mmap_fault(uint64 fault_va)
+{
+  struct proc *p = myproc();
+  struct vma *vma = 0;
+  
+  // Find the VMA containing the fault address
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used && 
+       fault_va >= p->vmas[i].addr && 
+       fault_va < p->vmas[i].addr + p->vmas[i].len) {
+      vma = &p->vmas[i];
+      break;
+    }
+  }
+  
+  if(vma == 0)
+    return -1;
+  
+  // Check if page is already mapped
+  uint64 page_start = PGROUNDDOWN(fault_va);
+  pte_t *pte = walk(p->pagetable, page_start, 0);
+  if(pte && (*pte & PTE_V)) {
+  // Page already mapped: this fault is due to permission (e.g., write on RO).
+  // Let the generic trap path handle it as a fatal fault.
+  return -1;
+  }
+  
+  // Allocate a physical page
+  char *mem = kalloc();
+  if(mem == 0)
+    return -1;
+  
+  memset(mem, 0, PGSIZE);
+  
+  // Read file content into the page
+  uint64 file_offset = vma->offset + (page_start - vma->addr);
+  
+  ilock(vma->f->ip);
+  int n = readi(vma->f->ip, 0, (uint64)mem, file_offset, PGSIZE);
+  iunlock(vma->f->ip);
+  
+  if(n < 0) {
+    kfree(mem);
+    return -1;
+  }
+  
+  // Set up page permissions
+  int perm = PTE_U;
+  if(vma->prot & PROT_READ) perm |= PTE_R;
+  if(vma->prot & PROT_WRITE) perm |= PTE_W;
+  if(vma->prot & PROT_EXEC) perm |= PTE_X;
+  
+  // Map the page
+  if(mappages(p->pagetable, page_start, PGSIZE, (uint64)mem, perm) != 0) {
+    kfree(mem);
+    return -1;
+  }
+  
+  return 0;
+}
+#endif

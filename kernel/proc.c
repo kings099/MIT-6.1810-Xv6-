@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
 
 struct cpu cpus[NCPU];
 
@@ -146,6 +150,13 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+#ifdef LAB_MMAP
+  // Initialize VMA array
+  for(int i = 0; i < NVMA; i++) {
+    p->vmas[i].used = 0;
+  }
+#endif
+
   return p;
 }
 
@@ -169,6 +180,12 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+#ifdef LAB_MMAP
+  // Clear VMA array
+  for(int i = 0; i < NVMA; i++) {
+    p->vmas[i].used = 0;
+  }
+#endif
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -308,6 +325,16 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+#ifdef LAB_MMAP
+  // Copy VMAs from parent to child
+  for(i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used) {
+      np->vmas[i] = p->vmas[i];
+      np->vmas[i].f = filedup(p->vmas[i].f);
+    }
+  }
+#endif
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -360,6 +387,54 @@ exit(int status)
     }
   }
 
+#ifdef LAB_MMAP
+  // Clean up mmap mappings: write back MAP_SHARED pages and unmap
+  for(int i = 0; i < NVMA; i++) {
+    if(p->vmas[i].used) {
+      struct vma *vma = &p->vmas[i];
+
+      if(vma->flags == MAP_SHARED) {
+        // Write back each mapped page without large on-stack buffers
+        for(uint64 va = vma->addr; va < vma->addr + vma->len; va += PGSIZE) {
+          pte_t *pte = walk(p->pagetable, va, 0);
+          if(pte && (*pte & PTE_V)) {
+            uint64 pa = PTE2PA(*pte);
+            uint64 off = vma->offset + (va - vma->addr);
+            // Clamp to file size
+            begin_op();
+            ilock(vma->f->ip);
+            uint64 bytes = 0;
+            uint64 file_end = vma->f->ip->size;
+            if(off < file_end) {
+              uint64 maxb = file_end - off;
+              bytes = maxb > PGSIZE ? PGSIZE : maxb;
+            }
+            if(bytes > 0) {
+              uint64 kva = pa; // PA is directly mapped in kernel
+              writei(vma->f->ip, 0, kva, off, bytes);
+            }
+            iunlock(vma->f->ip);
+            end_op();
+          }
+        }
+      }
+
+      // Unmap pages (only unmap pages that are actually mapped)
+      for(uint64 va = vma->addr; va < vma->addr + vma->len; va += PGSIZE) {
+        pte_t *pte = walk(p->pagetable, va, 0);
+        if(pte && (*pte & PTE_V)) {
+          uvmunmap(p->pagetable, va, 1, 1);
+        }
+      }
+
+      // Close file and clear VMA
+      fileclose(vma->f);
+      vma->used = 0;
+    }
+  }
+#endif
+
+  // Finalize working directory after mmap cleanup
   begin_op();
   iput(p->cwd);
   end_op();
